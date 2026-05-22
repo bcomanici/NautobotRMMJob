@@ -466,9 +466,15 @@ class SyncAutomoxDevices(Job):
         platform = Platform.objects.filter(name__iexact=platform_name).first()
 
         if platform is not None:
+            if self._model_has_field(Platform, "manufacturer") and platform.manufacturer is not None:
+                platform.manufacturer = None
+                platform.validated_save()
             return platform
 
         platform_kwargs = {"name": platform_name}
+
+        if self._model_has_field(Platform, "manufacturer"):
+            platform_kwargs["manufacturer"] = None
 
         if self._model_has_field(Platform, "slug"):
             platform_kwargs["slug"] = self._unique_slug(Platform, platform_name)
