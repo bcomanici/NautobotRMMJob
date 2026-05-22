@@ -4,6 +4,7 @@ Nautobot Job: Sync Automox devices into Nautobot Devices.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date
 from typing import Any, Dict, Iterable, List, Optional
@@ -190,6 +191,15 @@ class SyncAutomoxDevices(Job):
                 set_rmm_field=set_rmm_field,
             )
 
+            self.logger.info(
+                "Automox mapped fields for %s: manufacturer=%s model=%s cpu=%s installed_ram=%s",
+                hostname,
+                manufacturer_name,
+                model_name,
+                custom_fields.get("cpu"),
+                custom_fields.get("installed_ram"),
+            )
+
             if device is None:
                 device = Device(
                     name=hostname,
@@ -201,15 +211,15 @@ class SyncAutomoxDevices(Job):
                 )
                 device.validated_save()
 
-                for key, value in custom_fields.items():
-                    device.cf[key] = value
-
+                self._apply_custom_fields(device, custom_fields)
                 device.validated_save()
 
                 created += 1
                 self.logger.info(
-                    "Created device %s from Automox hostname %s.",
+                    "Created device %s with DeviceType %s/%s from Automox hostname %s.",
                     hostname,
+                    manufacturer_name,
+                    model_name,
                     raw_hostname,
                 )
             else:
@@ -219,15 +229,15 @@ class SyncAutomoxDevices(Job):
                 device.device_type = device_type
                 device.serial = serial or device.serial
 
-                for key, value in custom_fields.items():
-                    device.cf[key] = value
-
+                self._apply_custom_fields(device, custom_fields)
                 device.validated_save()
 
                 updated += 1
                 self.logger.info(
-                    "Updated device %s from Automox hostname %s.",
+                    "Updated device %s with DeviceType %s/%s from Automox hostname %s.",
                     device.name,
+                    manufacturer_name,
+                    model_name,
                     raw_hostname,
                 )
 
@@ -237,6 +247,11 @@ class SyncAutomoxDevices(Job):
         )
         self.logger.info(summary)
         return summary
+
+    @staticmethod
+    def _apply_custom_fields(device: Device, custom_fields: Dict[str, Any]) -> None:
+        for key, value in custom_fields.items():
+            device.cf[key] = value
 
     def _get_secret(self, secrets_group: SecretsGroup, secret_kind: str, required: bool = True) -> str:
         access_type = self._choice_value(
@@ -482,7 +497,7 @@ class SyncAutomoxDevices(Job):
                 candidates.append(SyncAutomoxDevices._normalize_hostname(str(value)))
 
         detail = SyncAutomoxDevices._detail(record)
-        fqdns = detail.get("FQDNS") or detail.get("fqdns") or []
+        fqdns = SyncAutomoxDevices._detail_value(detail, "FQDNS")
 
         if isinstance(fqdns, list):
             for fqdn in fqdns:
@@ -507,7 +522,7 @@ class SyncAutomoxDevices(Job):
             return value.strip()[:255]
 
         detail = SyncAutomoxDevices._detail(record)
-        fqdns = detail.get("FQDNS") or detail.get("fqdns") or []
+        fqdns = SyncAutomoxDevices._detail_value(detail, "FQDNS")
 
         if isinstance(fqdns, list) and fqdns:
             return str(fqdns[0]).strip()[:255]
@@ -527,78 +542,32 @@ class SyncAutomoxDevices(Job):
     @staticmethod
     def _manufacturer_name(record: Dict[str, Any]) -> str:
         detail = SyncAutomoxDevices._detail(record)
-        return (
-            SyncAutomoxDevices._detail_first_string(
-                detail,
-                "VENDOR",
-                "vendor",
-                "MANUFACTURER",
-                "manufacturer",
-            )
-            or SyncAutomoxDevices._first_string(record, "make", "manufacturer", "vendor")
-            or "Unknown"
-        )
+        return str(SyncAutomoxDevices._detail_value(detail, "VENDOR") or "Unknown").strip()
 
     @staticmethod
     def _model_name(record: Dict[str, Any]) -> str:
         detail = SyncAutomoxDevices._detail(record)
-        return (
-            SyncAutomoxDevices._detail_first_string(detail, "MODEL", "model")
-            or SyncAutomoxDevices._first_string(record, "model", "model_name", "hardware_model")
-            or "Unknown"
-        )
+        return str(SyncAutomoxDevices._detail_value(detail, "MODEL") or "Unknown").strip()
 
     @staticmethod
     def _serial_number(record: Dict[str, Any]) -> str:
         detail = SyncAutomoxDevices._detail(record)
-        return (
-            SyncAutomoxDevices._detail_first_string(
-                detail,
-                "SERIAL",
-                "serial",
-                "SERVICETAG",
-                "servicetag",
-            )
-            or SyncAutomoxDevices._first_string(
-                record,
-                "serial_number",
-                "serial",
-                "serialnum",
-                "service_tag",
-            )
-            or ""
-        )
-
-    @staticmethod
-    def _cpu_value(record: Dict[str, Any]) -> str:
-        detail = SyncAutomoxDevices._detail(record)
-        return (
-            SyncAutomoxDevices._detail_first_string(detail, "CPU", "cpu")
-            or SyncAutomoxDevices._first_string(
-                record,
-                "cpu",
-                "processor",
-                "processor_model",
-                "cpu_model",
-            )
+        return str(
+            SyncAutomoxDevices._detail_value(detail, "SERIAL")
+            or SyncAutomoxDevices._detail_value(detail, "SERVICETAG")
+            or record.get("serial_number")
             or ""
         ).strip()
 
     @staticmethod
+    def _cpu_value(record: Dict[str, Any]) -> str:
+        detail = SyncAutomoxDevices._detail(record)
+        return str(SyncAutomoxDevices._detail_value(detail, "CPU") or "").strip()
+
+    @staticmethod
     def _ram_value(record: Dict[str, Any]) -> str:
         detail = SyncAutomoxDevices._detail(record)
-        ram = (
-            SyncAutomoxDevices._detail_first_string(detail, "RAM", "ram")
-            or SyncAutomoxDevices._first_string(
-                record,
-                "installed_ram",
-                "ram",
-                "total_memory",
-                "memory",
-            )
-            or ""
-        )
-
+        ram = SyncAutomoxDevices._detail_value(detail, "RAM")
         return SyncAutomoxDevices._format_ram_value(ram)
 
     @staticmethod
@@ -626,15 +595,31 @@ class SyncAutomoxDevices(Job):
     @staticmethod
     def _detail(record: Dict[str, Any]) -> Dict[str, Any]:
         detail = record.get("detail") or {}
-        return detail if isinstance(detail, dict) else {}
+
+        if isinstance(detail, dict):
+            return detail
+
+        if isinstance(detail, str):
+            try:
+                parsed = json.loads(detail)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+
+        return {}
 
     @staticmethod
-    def _detail_first_string(detail: Dict[str, Any], *keys: str) -> str:
-        for key in keys:
-            value = detail.get(key)
-            if value is not None and value != "":
-                return str(value).strip()
-        return ""
+    def _detail_value(detail: Dict[str, Any], key: str) -> Any:
+        if key in detail:
+            return detail[key]
+
+        key_lower = key.lower()
+        for existing_key, value in detail.items():
+            if str(existing_key).lower() == key_lower:
+                return value
+
+        return None
 
     @staticmethod
     def _first_string(record: Dict[str, Any], *keys: str) -> str:
