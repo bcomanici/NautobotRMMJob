@@ -334,6 +334,7 @@ class SyncAutomoxDevices(Job):
                 org_query_param: org_key,
                 "limit": page_size,
                 "page": page,
+                "include_details": 1,
             }
 
             response = session.get(endpoint, params=params, timeout=60)
