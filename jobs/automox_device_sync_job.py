@@ -188,7 +188,6 @@ class SyncAutomoxDevices(Job):
                     device_type=device_type,
                     serial=serial,
                 )
-                device.custom_field_data = custom_fields
                 device.validated_save()
                 created += 1
                 self.logger.info("Created device %s.", hostname)
@@ -198,9 +197,6 @@ class SyncAutomoxDevices(Job):
                 device.status = device_status
                 device.device_type = device_type
                 device.serial = serial or device.serial
-                device.custom_field_data = {
-                    **(device.custom_field_data or {}),
-                    **custom_fields,
                 }
                 device.validated_save()
                 updated += 1
