@@ -28,7 +28,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 from django.contrib.contenttypes.models import ContentType
-from django.utils.text import slugify
+#from django.utils.text import slugify
 
 from nautobot.apps.jobs import BooleanVar, IntegerVar, Job, ObjectVar, StringVar, register_jobs
 from nautobot.dcim.models import Device, DeviceType, Location, Manufacturer
@@ -170,20 +170,31 @@ class SyncAutomoxDevices(Job):
             model_name = self._first_string(record, "model", "model_name", "hardware_model") or "Unknown"
             serial = self._first_string(record, "serial_number", "serial", "serialnum", "service_tag") or ""
 
-            device_type = self._get_or_create_device_type(
-                manufacturer_name=manufacturer_name,
-                model_name=model_name,
-                create_missing=create_missing_device_types,
-            )
-            if device_type is None:
-                skipped += 1
-                self.logger.warning(
-                    "Skipping %s because DeviceType %s/%s does not exist and creation is disabled.",
-                    hostname,
-                    manufacturer_name,
-                    model_name,
+            device_type = DeviceType.objects.filter(
+                manufacturer=manufacturer,
+                model=model_name,
+            ).first()
+
+            if not device_type:
+                device_type = DeviceType(
+                    manufacturer=manufacturer,
+                    model=model_name,
                 )
-                continue
+                device_type.validated_save()
+            #device_type = self._get_or_create_device_type(
+            #    manufacturer_name=manufacturer_name,
+            #    model_name=model_name,
+            #    create_missing=create_missing_device_types,
+            #)
+            #if device_type is None:
+            #    skipped += 1
+            #    self.logger.warning(
+            #        "Skipping %s because DeviceType %s/%s does not exist and creation is disabled.",
+            #        hostname,
+            #        manufacturer_name,
+            #        model_name,
+            #    )
+            #    continue
 
             custom_fields = self._custom_fields_from_automox(record, set_rmm_field=set_rmm_field)
 
@@ -448,16 +459,16 @@ class SyncAutomoxDevices(Job):
         return str(record.get("id") or record.get("uuid") or record.get("server_id") or "unknown")
 
     @staticmethod
-    def _unique_slug(model: Any, value: str) -> str:
-        base = slugify(value) or "unknown"
-        base = re.sub(r"[^a-z0-9_-]+", "-", base.lower()).strip("-") or "unknown"
-        slug = base[:50]
-        counter = 1
-        while model.objects.filter(slug=slug).exists():
-            suffix = f"-{counter}"
-            slug = f"{base[:50 - len(suffix)]}{suffix}"
-            counter += 1
-        return slug
+    #def _unique_slug(model: Any, value: str) -> str:
+    #    base = slugify(value) or "unknown"
+    #    base = re.sub(r"[^a-z0-9_-]+", "-", base.lower()).strip("-") or "unknown"
+    #    slug = base[:50]
+    #    counter = 1
+    #    while model.objects.filter(slug=slug).exists():
+    #        suffix = f"-{counter}"
+    #        slug = f"{base[:50 - len(suffix)]}{suffix}"
+    #        counter += 1
+    #    return slug
 
 
 register_jobs(SyncAutomoxDevices)
