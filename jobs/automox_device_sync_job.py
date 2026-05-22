@@ -15,6 +15,7 @@ from nautobot.apps.jobs import BooleanVar, IntegerVar, Job, ObjectVar, StringVar
 from nautobot.dcim.models import Device, DeviceType, Location, Manufacturer
 from nautobot.extras.choices import SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import Role, SecretsGroup, Status
+from nautobot.virtualization.models import VirtualMachine
 
 name = "RMM Integrations"
 
@@ -64,7 +65,7 @@ class SyncAutomoxDevices(Job):
     )
 
     create_missing_device_types = BooleanVar(
-        description="Create missing Manufacturer and DeviceType records from Automox make/model data.",
+        description="Create missing Manufacturer and DeviceType records from Automox detail.VENDOR/detail.MODEL.",
         default=True,
     )
 
@@ -118,7 +119,7 @@ class SyncAutomoxDevices(Job):
         if automox_username:
             self.logger.info("Using Automox credential set for: %s", automox_username)
 
-        devices = self._fetch_automox_servers(
+        records = self._fetch_automox_servers(
             base_url=automox_base_url,
             api_key=automox_api_key,
             org_query_param=automox_org_query_param,
@@ -126,13 +127,14 @@ class SyncAutomoxDevices(Job):
             page_size=request_page_size,
         )
 
-        self.logger.info("Fetched %s Automox device records.", len(devices))
+        self.logger.info("Fetched %s Automox device records.", len(records))
 
         created = 0
         updated = 0
         skipped = 0
+        skipped_vms = 0
 
-        for record in devices:
+        for record in records:
             raw_hostname = self._hostname(record)
             hostname = self._normalize_hostname(raw_hostname)
 
@@ -144,16 +146,28 @@ class SyncAutomoxDevices(Job):
                 )
                 continue
 
-            device = self._find_device_by_hostname(raw_hostname, hostname)
+            if self._find_virtual_machine_by_hostname(record, raw_hostname, hostname):
+                skipped += 1
+                skipped_vms += 1
+                self.logger.info(
+                    "Skipping Automox record %s because it exists as a Nautobot VirtualMachine.",
+                    raw_hostname,
+                )
+                continue
+
+            device = self._find_device_by_hostname(record, raw_hostname, hostname)
 
             if device and not update_existing_devices:
                 skipped += 1
-                self.logger.info("Skipping existing device because updates are disabled: %s", hostname)
+                self.logger.info(
+                    "Skipping existing device because updates are disabled: %s",
+                    hostname,
+                )
                 continue
 
-            manufacturer_name = self._first_string(record, "make", "manufacturer", "vendor") or "Unknown"
-            model_name = self._first_string(record, "model", "model_name", "hardware_model") or "Unknown"
-            serial = self._first_string(record, "serial_number", "serial", "serialnum", "service_tag") or ""
+            manufacturer_name = self._manufacturer_name(record)
+            model_name = self._model_name(record)
+            serial = self._serial_number(record)
 
             device_type = self._get_or_create_device_type(
                 manufacturer_name=manufacturer_name,
@@ -171,7 +185,10 @@ class SyncAutomoxDevices(Job):
                 )
                 continue
 
-            custom_fields = self._custom_fields_from_automox(record, set_rmm_field=set_rmm_field)
+            custom_fields = self._custom_fields_from_automox(
+                record,
+                set_rmm_field=set_rmm_field,
+            )
 
             if device is None:
                 device = Device(
@@ -190,7 +207,11 @@ class SyncAutomoxDevices(Job):
                 device.validated_save()
 
                 created += 1
-                self.logger.info("Created device %s from Automox hostname %s.", hostname, raw_hostname)
+                self.logger.info(
+                    "Created device %s from Automox hostname %s.",
+                    hostname,
+                    raw_hostname,
+                )
             else:
                 device.location = device.location or default_location
                 device.role = device.role or device_role
@@ -204,9 +225,16 @@ class SyncAutomoxDevices(Job):
                 device.validated_save()
 
                 updated += 1
-                self.logger.info("Updated device %s from Automox hostname %s.", device.name, raw_hostname)
+                self.logger.info(
+                    "Updated device %s from Automox hostname %s.",
+                    device.name,
+                    raw_hostname,
+                )
 
-        summary = f"Automox sync complete: {created} created, {updated} updated, {skipped} skipped."
+        summary = (
+            f"Automox sync complete: {created} created, {updated} updated, "
+            f"{skipped} skipped, {skipped_vms} skipped as existing VMs."
+        )
         self.logger.info(summary)
         return summary
 
@@ -239,7 +267,10 @@ class SyncAutomoxDevices(Job):
             raise ValueError(f"Unsupported secret kind: {secret_kind}")
 
         try:
-            value = secrets_group.get_secret_value(access_type=access_type, secret_type=secret_type)
+            value = secrets_group.get_secret_value(
+                access_type=access_type,
+                secret_type=secret_type,
+            )
         except Exception as exc:
             if required:
                 raise RuntimeError(
@@ -248,7 +279,9 @@ class SyncAutomoxDevices(Job):
             return ""
 
         if required and not value:
-            raise RuntimeError(f"Required secret {secret_kind!r} was empty in Secrets Group {secrets_group!s}.")
+            raise RuntimeError(
+                f"Required secret {secret_kind!r} was empty in Secrets Group {secrets_group!s}."
+            )
 
         return str(value or "").strip()
 
@@ -314,7 +347,9 @@ class SyncAutomoxDevices(Job):
             page += 1
 
             if page > 10000:
-                raise RuntimeError("Aborting Automox pagination after 10,000 pages; check API response shape.")
+                raise RuntimeError(
+                    "Aborting Automox pagination after 10,000 pages; check API response shape."
+                )
 
         return records
 
@@ -338,7 +373,7 @@ class SyncAutomoxDevices(Job):
         model_name: str,
         create_missing: bool,
     ) -> Optional[DeviceType]:
-        manufacturer = Manufacturer.objects.filter(name=manufacturer_name).first()
+        manufacturer = Manufacturer.objects.filter(name__iexact=manufacturer_name).first()
 
         if manufacturer is None:
             if not create_missing:
@@ -347,12 +382,18 @@ class SyncAutomoxDevices(Job):
             manufacturer_kwargs = {"name": manufacturer_name}
 
             if self._model_has_field(Manufacturer, "slug"):
-                manufacturer_kwargs["slug"] = self._unique_slug(Manufacturer, manufacturer_name)
+                manufacturer_kwargs["slug"] = self._unique_slug(
+                    Manufacturer,
+                    manufacturer_name,
+                )
 
             manufacturer = Manufacturer(**manufacturer_kwargs)
             manufacturer.validated_save()
 
-        device_type = DeviceType.objects.filter(manufacturer=manufacturer, model=model_name).first()
+        device_type = DeviceType.objects.filter(
+            manufacturer=manufacturer,
+            model__iexact=model_name,
+        ).first()
 
         if device_type is not None:
             return device_type
@@ -366,7 +407,10 @@ class SyncAutomoxDevices(Job):
         }
 
         if self._model_has_field(DeviceType, "slug"):
-            device_type_kwargs["slug"] = self._unique_slug(DeviceType, f"{manufacturer_name}-{model_name}")
+            device_type_kwargs["slug"] = self._unique_slug(
+                DeviceType,
+                f"{manufacturer_name}-{model_name}",
+            )
 
         device_type = DeviceType(**device_type_kwargs)
         device_type.validated_save()
@@ -380,7 +424,7 @@ class SyncAutomoxDevices(Job):
     @staticmethod
     def _custom_fields_from_automox(record: Dict[str, Any], *, set_rmm_field: bool) -> Dict[str, Any]:
         custom_fields: Dict[str, Any] = {
-            "agent_version": SyncAutomoxDevices._first_string(record, "agent_version", "agentVersion") or "",
+            "agent_version": SyncAutomoxDevices._first_string(record, "agent_version") or "",
             "cpu": SyncAutomoxDevices._cpu_value(record),
             "installed_ram": SyncAutomoxDevices._ram_value(record),
             "needs_attention": SyncAutomoxDevices._boolish_string(record.get("needs_attention")),
@@ -395,37 +439,80 @@ class SyncAutomoxDevices(Job):
         return custom_fields
 
     @staticmethod
-    def _find_device_by_hostname(raw_hostname: str, normalized_hostname: str) -> Optional[Device]:
-        candidates = []
-
-        if raw_hostname:
-            candidates.append(raw_hostname.strip())
-
-        if normalized_hostname:
-            candidates.append(normalized_hostname.strip())
-
-        for candidate in dict.fromkeys(candidates):
+    def _find_device_by_hostname(
+        record: Dict[str, Any],
+        raw_hostname: str,
+        normalized_hostname: str,
+    ) -> Optional[Device]:
+        for candidate in SyncAutomoxDevices._hostname_candidates(record, raw_hostname, normalized_hostname):
             device = Device.objects.filter(name__iexact=candidate).first()
             if device is not None:
                 return device
-
         return None
+
+    @staticmethod
+    def _find_virtual_machine_by_hostname(
+        record: Dict[str, Any],
+        raw_hostname: str,
+        normalized_hostname: str,
+    ) -> Optional[VirtualMachine]:
+        for candidate in SyncAutomoxDevices._hostname_candidates(record, raw_hostname, normalized_hostname):
+            vm = VirtualMachine.objects.filter(name__iexact=candidate).first()
+            if vm is not None:
+                return vm
+        return None
+
+    @staticmethod
+    def _hostname_candidates(
+        record: Dict[str, Any],
+        raw_hostname: str,
+        normalized_hostname: str,
+    ) -> List[str]:
+        candidates = []
+
+        for value in (
+            raw_hostname,
+            normalized_hostname,
+            record.get("name"),
+            record.get("display_name"),
+            record.get("custom_name"),
+        ):
+            if value:
+                candidates.append(str(value).strip())
+                candidates.append(SyncAutomoxDevices._normalize_hostname(str(value)))
+
+        detail = SyncAutomoxDevices._detail(record)
+        fqdns = detail.get("FQDNS") or detail.get("fqdns") or []
+
+        if isinstance(fqdns, list):
+            for fqdn in fqdns:
+                if fqdn:
+                    candidates.append(str(fqdn).strip())
+                    candidates.append(SyncAutomoxDevices._normalize_hostname(str(fqdn)))
+
+        return [candidate for candidate in dict.fromkeys(candidates) if candidate]
 
     @staticmethod
     def _hostname(record: Dict[str, Any]) -> str:
         value = SyncAutomoxDevices._first_string(
             record,
             "name",
-            "hostname",
             "display_name",
+            "hostname",
             "server_name",
             "fqdn",
         )
 
-        if not value:
-            return ""
+        if value:
+            return value.strip()[:255]
 
-        return value.strip()[:255]
+        detail = SyncAutomoxDevices._detail(record)
+        fqdns = detail.get("FQDNS") or detail.get("fqdns") or []
+
+        if isinstance(fqdns, list) and fqdns:
+            return str(fqdns[0]).strip()[:255]
+
+        return ""
 
     @staticmethod
     def _normalize_hostname(value: str) -> str:
@@ -438,91 +525,123 @@ class SyncAutomoxDevices(Job):
         return short_name[:64]
 
     @staticmethod
-    def _first_string(record: Dict[str, Any], *keys: str) -> str:
+    def _manufacturer_name(record: Dict[str, Any]) -> str:
+        detail = SyncAutomoxDevices._detail(record)
+        return (
+            SyncAutomoxDevices._detail_first_string(
+                detail,
+                "VENDOR",
+                "vendor",
+                "MANUFACTURER",
+                "manufacturer",
+            )
+            or SyncAutomoxDevices._first_string(record, "make", "manufacturer", "vendor")
+            or "Unknown"
+        )
+
+    @staticmethod
+    def _model_name(record: Dict[str, Any]) -> str:
+        detail = SyncAutomoxDevices._detail(record)
+        return (
+            SyncAutomoxDevices._detail_first_string(detail, "MODEL", "model")
+            or SyncAutomoxDevices._first_string(record, "model", "model_name", "hardware_model")
+            or "Unknown"
+        )
+
+    @staticmethod
+    def _serial_number(record: Dict[str, Any]) -> str:
+        detail = SyncAutomoxDevices._detail(record)
+        return (
+            SyncAutomoxDevices._detail_first_string(
+                detail,
+                "SERIAL",
+                "serial",
+                "SERVICETAG",
+                "servicetag",
+            )
+            or SyncAutomoxDevices._first_string(
+                record,
+                "serial_number",
+                "serial",
+                "serialnum",
+                "service_tag",
+            )
+            or ""
+        )
+
+    @staticmethod
+    def _cpu_value(record: Dict[str, Any]) -> str:
+        detail = SyncAutomoxDevices._detail(record)
+        return (
+            SyncAutomoxDevices._detail_first_string(detail, "CPU", "cpu")
+            or SyncAutomoxDevices._first_string(
+                record,
+                "cpu",
+                "processor",
+                "processor_model",
+                "cpu_model",
+            )
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _ram_value(record: Dict[str, Any]) -> str:
+        detail = SyncAutomoxDevices._detail(record)
+        ram = (
+            SyncAutomoxDevices._detail_first_string(detail, "RAM", "ram")
+            or SyncAutomoxDevices._first_string(
+                record,
+                "installed_ram",
+                "ram",
+                "total_memory",
+                "memory",
+            )
+            or ""
+        )
+
+        return SyncAutomoxDevices._format_ram_value(ram)
+
+    @staticmethod
+    def _format_ram_value(value: Any) -> str:
+        if value is None or value == "":
+            return ""
+
+        text = str(value).strip()
+
+        if not text.isdigit():
+            return text
+
+        try:
+            bytes_value = int(text)
+            gb_value = bytes_value / (1024 ** 3)
+
+            if gb_value.is_integer():
+                return f"{int(gb_value)} GB"
+
+            return f"{gb_value:.2f} GB"
+
+        except Exception:
+            return text
+
+    @staticmethod
+    def _detail(record: Dict[str, Any]) -> Dict[str, Any]:
+        detail = record.get("detail") or {}
+        return detail if isinstance(detail, dict) else {}
+
+    @staticmethod
+    def _detail_first_string(detail: Dict[str, Any], *keys: str) -> str:
         for key in keys:
-            value = record.get(key)
+            value = detail.get(key)
             if value is not None and value != "":
                 return str(value).strip()
         return ""
 
     @staticmethod
-    def _cpu_value(record: Dict[str, Any]) -> str:
-        direct_value = SyncAutomoxDevices._first_string(
-            record,
-            "cpu",
-            "processor",
-            "processors",
-            "processor_model",
-            "cpu_model",
-            "cpu_name",
-        )
-
-        if direct_value:
-            return direct_value
-
-        for container_key in ("detail", "details", "hardware", "hardware_info", "system_info"):
-            container = record.get(container_key)
-            value = SyncAutomoxDevices._nested_first_string(
-                container,
-                "cpu",
-                "processor",
-                "processors",
-                "processor_model",
-                "cpu_model",
-                "cpu_name",
-            )
-            if value:
-                return value
-
-        return ""
-
-    @staticmethod
-    def _ram_value(record: Dict[str, Any]) -> str:
-        direct_value = SyncAutomoxDevices._first_string(
-            record,
-            "installed_ram",
-            "ram",
-            "total_ram",
-            "total_memory",
-            "memory",
-            "memory_size",
-            "physical_memory",
-        )
-
-        if direct_value:
-            return direct_value
-
-        for container_key in ("detail", "details", "hardware", "hardware_info", "system_info"):
-            container = record.get(container_key)
-            value = SyncAutomoxDevices._nested_first_string(
-                container,
-                "installed_ram",
-                "ram",
-                "total_ram",
-                "total_memory",
-                "memory",
-                "memory_size",
-                "physical_memory",
-            )
-            if value:
-                return value
-
-        return ""
-
-    @staticmethod
-    def _nested_first_string(value: Any, *keys: str) -> str:
-        if isinstance(value, dict):
-            for key in keys:
-                nested_value = value.get(key)
-                if nested_value is not None and nested_value != "":
-                    return str(nested_value).strip()
-
-        if isinstance(value, list):
-            for item in value:
-                found = SyncAutomoxDevices._nested_first_string(item, *keys)
-                if found:
-                    return found
-
+    def _first_string(record: Dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = record.get(key)
+            if value is not None and value != "":
+                return str(value).strip()
         return ""
 
     @staticmethod
@@ -533,7 +652,6 @@ class SyncAutomoxDevices(Job):
                 return str(len(value))
             if value is not None and value != "":
                 return str(value)
-
         return ""
 
     @staticmethod
@@ -548,7 +666,12 @@ class SyncAutomoxDevices(Job):
 
     @staticmethod
     def _safe_record_id(record: Dict[str, Any]) -> str:
-        return str(record.get("id") or record.get("uuid") or record.get("server_id") or "unknown")
+        return str(
+            record.get("id")
+            or record.get("uuid")
+            or record.get("server_id")
+            or "unknown"
+        )
 
     @staticmethod
     def _unique_slug(model: Any, value: str) -> str:
