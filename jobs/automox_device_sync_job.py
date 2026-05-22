@@ -13,7 +13,7 @@ import requests
 from django.utils.text import slugify
 
 from nautobot.apps.jobs import BooleanVar, IntegerVar, Job, ObjectVar, StringVar, register_jobs
-from nautobot.dcim.models import Device, DeviceType, Location, Manufacturer
+from nautobot.dcim.models import Device, DeviceType, Location, Manufacturer, Platform, SoftwareVersion
 from nautobot.extras.choices import SecretsGroupAccessTypeChoices, SecretsGroupSecretTypeChoices
 from nautobot.extras.models import Role, SecretsGroup, Status
 from nautobot.virtualization.models import VirtualMachine
@@ -186,16 +186,21 @@ class SyncAutomoxDevices(Job):
                 )
                 continue
 
+            platform = self._get_or_create_platform(record)
+            software_version = self._get_or_create_software_version(record, platform=platform)
+
             custom_fields = self._custom_fields_from_automox(
                 record,
                 set_rmm_field=set_rmm_field,
             )
 
             self.logger.info(
-                "Automox mapped fields for %s: manufacturer=%s model=%s cpu=%s installed_ram=%s",
+                "Automox mapped fields for %s: manufacturer=%s model=%s platform=%s software_version=%s cpu=%s installed_ram=%s",
                 hostname,
                 manufacturer_name,
                 model_name,
+                platform.name if platform else "",
+                software_version.version if software_version else "",
                 custom_fields.get("cpu"),
                 custom_fields.get("installed_ram"),
             )
@@ -210,6 +215,15 @@ class SyncAutomoxDevices(Job):
                     serial=serial,
                 )
                 device.validated_save()
+
+                device.device_type = device_type
+                device.serial = serial or device.serial
+
+                if platform is not None:
+                    device.platform = platform
+
+                if software_version is not None and self._model_has_field(Device, "software_version"):
+                    device.software_version = software_version
 
                 self._apply_custom_fields(device, custom_fields)
                 device.validated_save()
@@ -228,6 +242,12 @@ class SyncAutomoxDevices(Job):
                 device.status = device_status
                 device.device_type = device_type
                 device.serial = serial or device.serial
+
+                if platform is not None:
+                    device.platform = platform
+
+                if software_version is not None and self._model_has_field(Device, "software_version"):
+                    device.software_version = software_version
 
                 self._apply_custom_fields(device, custom_fields)
                 device.validated_save()
@@ -432,6 +452,64 @@ class SyncAutomoxDevices(Job):
         device_type.validated_save()
 
         return device_type
+
+    def _get_or_create_platform(self, record: Dict[str, Any]) -> Optional[Platform]:
+        os_family = str(record.get("os_family") or "").strip()
+        os_name = str(record.get("os_name") or "").strip()
+
+        platform_name = " ".join(part for part in [os_family, os_name] if part).strip()
+
+        if not platform_name:
+            return None
+
+        platform = Platform.objects.filter(name__iexact=platform_name).first()
+
+        if platform is not None:
+            return platform
+
+        platform_kwargs = {"name": platform_name}
+
+        if self._model_has_field(Platform, "slug"):
+            platform_kwargs["slug"] = self._unique_slug(Platform, platform_name)
+
+        platform = Platform(**platform_kwargs)
+        platform.validated_save()
+
+        return platform
+
+    def _get_or_create_software_version(
+        self,
+        record: Dict[str, Any],
+        *,
+        platform: Optional[Platform],
+    ) -> Optional[SoftwareVersion]:
+        version = str(record.get("os_version") or "").strip()
+
+        if not version:
+            return None
+
+        query = SoftwareVersion.objects.filter(version__iexact=version)
+
+        if platform is not None and self._model_has_field(SoftwareVersion, "platform"):
+            query = query.filter(platform=platform)
+
+        software_version = query.first()
+
+        if software_version is not None:
+            return software_version
+
+        software_version_kwargs = {"version": version}
+
+        if platform is not None and self._model_has_field(SoftwareVersion, "platform"):
+            software_version_kwargs["platform"] = platform
+
+        if self._model_has_field(SoftwareVersion, "alias"):
+            software_version_kwargs["alias"] = version
+
+        software_version = SoftwareVersion(**software_version_kwargs)
+        software_version.validated_save()
+
+        return software_version
 
     @staticmethod
     def _model_has_field(model: Any, field_name: str) -> bool:
