@@ -458,4 +458,4 @@ class SyncAutomoxDevices(Job):
         return slug
 
 
-register_jobs(SyncAutomoxDevices)
+\#register_jobs(SyncAutomoxDevices)
