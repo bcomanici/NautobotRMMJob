@@ -10,6 +10,7 @@ from datetime import date
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+from django.contrib.contenttypes.models import ContentType
 from django.utils.text import slugify
 
 from nautobot.apps.jobs import BooleanVar, IntegerVar, Job, ObjectVar, StringVar, register_jobs
@@ -503,13 +504,30 @@ class SyncAutomoxDevices(Job):
         if platform is not None and self._model_has_field(SoftwareVersion, "platform"):
             software_version_kwargs["platform"] = platform
 
-        if self._model_has_field(SoftwareVersion, "alias"):
-            software_version_kwargs["alias"] = version
+        if self._model_has_field(SoftwareVersion, "status"):
+            status = self._get_status_for_model(SoftwareVersion)
+            if status is None:
+                raise RuntimeError(
+                    "Could not create SoftwareVersion because no Status exists for SoftwareVersion. "
+                    "Create a Status such as Active for the Software Version content type."
+                )
+            software_version_kwargs["status"] = status
 
         software_version = SoftwareVersion(**software_version_kwargs)
         software_version.validated_save()
 
         return software_version
+
+    @staticmethod
+    def _get_status_for_model(model: Any) -> Optional[Status]:
+        content_type = ContentType.objects.get_for_model(model)
+        queryset = Status.objects.filter(content_types=content_type)
+
+        return (
+            queryset.filter(name__iexact="Active").first()
+            or queryset.filter(name__iexact="Current").first()
+            or queryset.first()
+        )
 
     @staticmethod
     def _model_has_field(model: Any, field_name: str) -> bool:
