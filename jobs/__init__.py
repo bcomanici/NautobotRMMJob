@@ -11,5 +11,4 @@ class TestRMMJob(Job):
         return "OK"
 
 
-jobs = (TestRMMJob,)
-register_jobs(*jobs)
+register_jobs(TestRMMJob)
