@@ -350,7 +350,9 @@ class SyncAutomoxDevices(Job):
         if manufacturer is None:
             if not create_missing:
                 return None
-            manufacturer = Manufacturer(name=manufacturer_name, slug=self._unique_slug(Manufacturer, manufacturer_name))
+            #manufacturer = Manufacturer(name=manufacturer_name, slug=self._unique_slug(Manufacturer, manufacturer_name))
+            manufacturer = Manufacturer(name=manufacturer_name)
+            #manufacturer, _ = Manufacturer.objects.get_or_create(name=manufacturer_name)
             manufacturer.validated_save()
 
         device_type = DeviceType.objects.filter(manufacturer=manufacturer, model=model_name).first()
