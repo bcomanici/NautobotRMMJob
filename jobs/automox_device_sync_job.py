@@ -137,6 +137,7 @@ class SyncAutomoxDevices(Job):
 
         for record in devices:
             hostname = self._hostname(record)
+
             if not hostname:
                 skipped += 1
                 self.logger.warning(
@@ -146,6 +147,7 @@ class SyncAutomoxDevices(Job):
                 continue
 
             device = Device.objects.filter(name=hostname).first()
+
             if device and not update_existing_devices:
                 skipped += 1
                 self.logger.info(
@@ -188,17 +190,29 @@ class SyncAutomoxDevices(Job):
                     device_type=device_type,
                     serial=serial,
                 )
+
                 device.validated_save()
+
+                for key, value in custom_fields.items():
+                    device.cf[key] = value
+
+                device.validated_save()
+
                 created += 1
                 self.logger.info("Created device %s.", hostname)
+
             else:
                 device.location = device.location or default_location
                 device.role = device.role or device_role
                 device.status = device_status
                 device.device_type = device_type
                 device.serial = serial or device.serial
-                }
+
+                for key, value in custom_fields.items():
+                    device.cf[key] = value
+
                 device.validated_save()
+
                 updated += 1
                 self.logger.info("Updated device %s.", hostname)
 
