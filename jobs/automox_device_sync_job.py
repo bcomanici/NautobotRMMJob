@@ -470,5 +470,4 @@ class SyncAutomoxDevices(Job):
     #        counter += 1
     #    return slug
 
-
-register_jobs(SyncAutomoxDevices)
+    register_jobs(SyncAutomoxDevices)
