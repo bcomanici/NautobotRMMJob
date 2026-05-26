@@ -37,8 +37,34 @@ class SyncAutomoxDevices(Job):
 
     device_role = ObjectVar(
         model=Role,
-        description="Role assigned to newly created Automox devices.",
+        description="Fallback role assigned to newly created Automox devices when no prefix rule matches.",
         query_params={"content_types": "dcim.device"},
+    )
+
+    end_user_role = ObjectVar(
+        model=Role,
+        description="Role assigned when the hostname starts with one of the End User prefixes.",
+        query_params={"content_types": "dcim.device"},
+        required=False,
+    )
+
+    end_user_prefixes = StringVar(
+        description="Comma-separated hostname prefixes for End User devices. Example: LT-,DT-,WS-",
+        default="",
+        required=False,
+    )
+
+    bare_metal_server_role = ObjectVar(
+        model=Role,
+        description="Role assigned when the hostname starts with one of the Bare Metal Server prefixes.",
+        query_params={"content_types": "dcim.device"},
+        required=False,
+    )
+
+    bare_metal_server_prefixes = StringVar(
+        description="Comma-separated hostname prefixes for Bare Metal Servers. Example: SRV-,BM-",
+        default="",
+        required=False,
     )
 
     device_status = ObjectVar(
@@ -91,6 +117,10 @@ class SyncAutomoxDevices(Job):
             "secrets_group",
             "default_location",
             "device_role",
+            "end_user_role",
+            "end_user_prefixes",
+            "bare_metal_server_role",
+            "bare_metal_server_prefixes",
             "device_status",
             "automox_base_url",
             "automox_org_query_param",
@@ -106,6 +136,10 @@ class SyncAutomoxDevices(Job):
         secrets_group: SecretsGroup,
         default_location: Location,
         device_role: Role,
+        end_user_role: Optional[Role],
+        end_user_prefixes: str,
+        bare_metal_server_role: Optional[Role],
+        bare_metal_server_prefixes: str,
         device_status: Status,
         automox_base_url: str,
         automox_org_query_param: str,
@@ -147,6 +181,15 @@ class SyncAutomoxDevices(Job):
                     self._safe_record_id(record),
                 )
                 continue
+
+            selected_device_role = self._role_for_hostname(
+                hostname=hostname,
+                default_role=device_role,
+                end_user_role=end_user_role,
+                end_user_prefixes=end_user_prefixes,
+                bare_metal_server_role=bare_metal_server_role,
+                bare_metal_server_prefixes=bare_metal_server_prefixes,
+            )
 
             if self._find_virtual_machine_by_hostname(record, raw_hostname, hostname):
                 skipped += 1
@@ -196,7 +239,7 @@ class SyncAutomoxDevices(Job):
             )
 
             self.logger.info(
-                "Automox mapped fields for %s: manufacturer=%s model=%s platform=%s software_version=%s cpu=%s installed_ram=%s",
+                "Automox mapped fields for %s: manufacturer=%s model=%s platform=%s software_version=%s cpu=%s installed_ram=%s selected_role=%s",
                 hostname,
                 manufacturer_name,
                 model_name,
@@ -204,13 +247,14 @@ class SyncAutomoxDevices(Job):
                 software_version.version if software_version else "",
                 custom_fields.get("cpu"),
                 custom_fields.get("installed_ram"),
+                selected_device_role.name if selected_device_role else "",
             )
 
             if device is None:
                 device = Device(
                     name=hostname,
                     location=default_location,
-                    role=device_role,
+                    role=selected_device_role,
                     status=device_status,
                     device_type=device_type,
                     serial=serial,
@@ -231,15 +275,21 @@ class SyncAutomoxDevices(Job):
 
                 created += 1
                 self.logger.info(
-                    "Created device %s with DeviceType %s/%s from Automox hostname %s.",
+                    "Created device %s with DeviceType %s/%s and role %s from Automox hostname %s.",
                     hostname,
                     manufacturer_name,
                     model_name,
+                    selected_device_role.name if selected_device_role else "",
                     raw_hostname,
                 )
             else:
                 device.location = device.location or default_location
-                device.role = device.role or device_role
+
+                if selected_device_role != device_role:
+                    device.role = selected_device_role
+                else:
+                    device.role = device.role or device_role
+
                 device.status = device_status
                 device.device_type = device_type
                 device.serial = serial or device.serial
@@ -255,10 +305,11 @@ class SyncAutomoxDevices(Job):
 
                 updated += 1
                 self.logger.info(
-                    "Updated device %s with DeviceType %s/%s from Automox hostname %s.",
+                    "Updated device %s with DeviceType %s/%s and role %s from Automox hostname %s.",
                     device.name,
                     manufacturer_name,
                     model_name,
+                    device.role.name if device.role else "",
                     raw_hostname,
                 )
 
@@ -579,6 +630,40 @@ class SyncAutomoxDevices(Job):
             if vm is not None:
                 return vm
         return None
+
+    @staticmethod
+    def _role_for_hostname(
+        *,
+        hostname: str,
+        default_role: Role,
+        end_user_role: Optional[Role],
+        end_user_prefixes: str,
+        bare_metal_server_role: Optional[Role],
+        bare_metal_server_prefixes: str,
+    ) -> Role:
+        hostname_lower = hostname.lower()
+
+        if end_user_role is not None and SyncAutomoxDevices._matches_prefix(
+            hostname_lower,
+            end_user_prefixes,
+        ):
+            return end_user_role
+
+        if bare_metal_server_role is not None and SyncAutomoxDevices._matches_prefix(
+            hostname_lower,
+            bare_metal_server_prefixes,
+        ):
+            return bare_metal_server_role
+
+        return default_role
+
+    @staticmethod
+    def _matches_prefix(hostname_lower: str, prefixes: str) -> bool:
+        for prefix in re.split(r"[\s,;]+", prefixes or ""):
+            prefix = prefix.strip().lower()
+            if prefix and hostname_lower.startswith(prefix):
+                return True
+        return False
 
     @staticmethod
     def _hostname_candidates(
